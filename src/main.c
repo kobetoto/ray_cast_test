@@ -1,583 +1,672 @@
-#include "../includes/game.h"
-/**
- * MAPPING
- */
-char	**get_map(void)
-{
-	char	**m;
+#include "game.h"
+#include <unistd.h>   /* write(), etc. */
+#include <string.h>   /* strlen(), memset() */
+#include <stdio.h>    /* snprintf() pour le helper de chargement */
 
-	m = (char **)malloc(sizeof(char *) * 20);
-	if (!m)
-		return (NULL);
-	m[0] = "111111111111111";
-	m[1] = "100000000000001";
-	m[2] = "100000000000001";
-	m[3] = "100000000000001";
-	m[4] = "100000000000001";
-	m[5] = "100000010000001";
-	m[6] = "100000000000001";
-	m[7] = "100000000000001";
-	m[8] = "100000011111001";
-    m[9] = "100000000000001";
-	m[10] = "100000000000001";
-	m[11] = "100000000000001";
-	m[12] = "100000000000001";
-    m[13] = "100111110000001";
-	m[14] = "100000000000001";
-	m[15] = "100000000000001";
-	m[16] = "100000000000001";
-	m[17] = "111111111111111";
-	m[18] = NULL;
-	return (m);
+/* ==========================================================================
+**  Helpers — erreurs & pixels
+**  --------------------------------------------------------------------------
+**  panic       : affiche un message d'erreur sur stderr et quitte le programme
+**  rgb         : compose un entier 0xRRGGBB depuis des composantes 0..255
+**  put_pixel   : écrit un pixel (couleur) dans une image MLX (framebuffer)
+** ========================================================================== */
+
+void    panic(const char *msg)
+{
+    /* Écrit le message d'erreur sur la sortie d'erreur (descripteur 2) */
+    write(2, msg, strlen(msg));
+    write(2, "\n", 1);
+    /* Termine le programme avec un code de sortie d'erreur */
+    exit(1);
 }
 
-
-/**
- * INIT
- */
- int	init_game(t_game *g)
+int     rgb(int r, int g, int b)
 {
-	init_player(&g->player);
-	g->map = get_map();
-	if (!g->map)
-		return (1);
-	g->mlx = mlx_init();
-	if (!g->mlx)
-		return (1);
-	g->win = mlx_new_window(g->mlx, WIDTH, HEIGHT, "Game");
-	if (!g->win)
-		return (1);
-	g->img = mlx_new_image(g->mlx, WIDTH, HEIGHT);
-	if (!g->img)
-		return (1);
-	g->data = mlx_get_data_addr(g->img, &g->bpp, &g->size_line, &g->endian);
-	if (!g->data)
-		return (1);
-	return (0);
+    /* Sécurise les bornes des composantes entre 0 et 255
+       (évite des dépassements si le calcul d'une couleur sort de l'intervalle) */
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    /* Pack 3 octets R, G, B dans un entier 0xRRGGBB (format attendu par MLX) */
+    return (r << 16) | (g << 8) | b;
 }
 
-/**
- * put pixel in a buffer memory (not in mlx window directly)
- */
- void	put_pixel(int x, int y, int color, t_game *g)
+void    put_pixel(t_img *img, int x, int y, int color)
 {
-	int	offset;
-	int	bpp8;
+    char *p;
 
-	if (x < 0 || y < 0 || x >= WIDTH || y >= HEIGHT)
-		return ;
-	bpp8 = g->bpp / 8;
-	offset = y * g->size_line + x * bpp8;
-	g->data[offset + 0] = color & 0xFF;
-	g->data[offset + 1] = (color >> 8) & 0xFF;
-	g->data[offset + 2] = (color >> 16) & 0xFF;
+    /* Ignore toute écriture hors-bord pour éviter un segfault */
+    if (x < 0 || x >= img->w || y < 0 || y >= img->h)
+        return ;
+    /* Calcule l'adresse du pixel (ligne + colonne * taille pixel) */
+    p = img->addr + (y * img->line_len + x * (img->bpp / 8));
+    /* Écrit la couleur (int 0xRRGGBB) dans l'image MLX */
+    *(int *)p = color;
 }
 
-/**
- * clearing
- */
- void	clear_image(t_game *g)
-{
-	int	x;
-	int	y;
+/* ==========================================================================
+**  Frame / Textures
+**  --------------------------------------------------------------------------
+**  clampi      : borne un entier entre lo et hi
+**  wrapi       : fait un modulo positif (wrap) pour répéter une coordonnée
+**  texel_at    : lit un pixel (texel) dans une texture MLX aux coords (u,v)
+**  try_load_xpm_paths : tente de charger un XPM depuis plusieurs chemins
+**  create_frame: crée une image MLX qui sert de framebuffer
+**  destroy_frame: détruit ce framebuffer
+**  load_xpm    : charge un fichier XPM dans une structure t_tex
+**  destroy_tex : détruit l'image MLX d'une texture
+** ========================================================================== */
 
-	y = 0;
-	while (y < HEIGHT)
-	{
-		x = 0;
-		while (x < WIDTH)
-		{
-			put_pixel(x, y, 0x000000, g);
-			x++;
-		}
-		y++;
-	}
+static inline int  clampi(int v, int lo, int hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }
 
-
-/**
- * "solo block" UTILS
- */
-static bool map_inside(t_game *g, int cy, int cx)
+static inline int  wrapi(int v, int m)
 {
-    if (cy < 0) return false;
-    if (!g->map[cy]) return false;
-    if (cx < 0) return false;
-    if (!g->map[cy][cx]) return false;
-    return true;
+    int r;
+
+    /* Gestion de cas pathologique (évite division par 0) */
+    if (m <= 0) return 0;
+    /* Modulo classique, puis on s'assure d'un résultat positif */
+    r = v % m;
+    if (r < 0) r += m;
+    return r;
 }
 
-/**
- * 
- * true si la case est un bord de la map (au moins un "voisin" sort des bornes)
- * nord 
- * sud  
- * ouest
- * est  
- * */
-static bool is_border_cell(t_game *g, int cy, int cx)
+static inline int  texel_at(t_tex *t, int u, int v)
 {
-    return (!map_inside(g, cy-1, cx) ||
-            !map_inside(g, cy+1, cx) ||
-            !map_inside(g, cy, cx-1) ||
-            !map_inside(g, cy, cx+1)); 
+    char *p;
+
+    /* On répète horizontalement (u) et on borne verticalement (v) */
+    u = wrapi(u, t->w);
+    v = clampi(v, 0, t->h - 1);
+    /* Adresse du texel = base + (ligne * stride + colonne * bytes_per_pixel) */
+    p = t->addr + (v * t->line_len + u * (t->bpp / 8));
+    /* Retourne la couleur lue (format MLX 0xRRGGBB) */
+    return *(int *)p;
 }
 
-/* true si la case '1' est isolée: N,S,E,W ne sont PAS des murs,
-   et la case n'est pas au bord de la map */
-static bool is_solo_block(t_game *g, int cy, int cx)
+/* Essaie plusieurs emplacements standards pour trouver l’asset.
+   - file       : nom du fichier (ex. "sky.xpm")
+   - cand[]     : liste d'emplacements tentés ("src/", "assets/", etc.)
+   - On concatène le chemin + fichier dans buf, puis on teste load_xpm.
+   - Renvoie 1 si succès, 0 sinon. */
+static int  try_load_xpm_paths(t_game *g, t_tex *dst, const char *file)
 {
-    if (!map_inside(g, cy, cx))
-		return false;
-    if (g->map[cy][cx] != '1')
-		return false;
-    if (is_border_cell(g, cy, cx))
-		return false;
+    const char  *cand[] = { file, "src/", "assets/", "./src/", "./assets/", NULL };
+    char        buf[512];
+    int         i;
+    size_t      n;
 
-    return (g->map[cy-1][cx] != '1' &&
-            g->map[cy+1][cx] != '1' &&
-            g->map[cy][cx-1] != '1' &&
-            g->map[cy][cx+1] != '1');
-}
-
-/**
- * Convertit la distance perpendiculaire en hauteur projetée (h) (perspective).
- * Calcule le segment vertical (du haut y0 au bas y1) où dessiner la colonne du mur, centré verticalement.
- */
- void	compute_strip_bounds(float dist, int *y0, int *y1, int *h)
-{
-	float	hf;
-	int		top;
-	int		botom;
-
-	/*hf = hauteur projetée du mur à l’écran en pixels*/
-	hf = (BLOCK / dist) * (WIDTH / 1.7f);
-	/*hauteur du mur en pixels à dessiner dans la fenêtre.*/
-	*h = (int)hf;
-	top = (HEIGHT - *h) / 2;
-	botom = top + *h;
-	/*si tres proche de la map (clamping)*/
-	if (top < 0)
-		top = 0;
-	if (botom > HEIGHT)
-		botom = HEIGHT;
-	*y0 = top;
-	*y1 = botom;
-}
-
- void	compute_tex_vscroll(const t_tex *t, int h, int y0,
-				float *step, float *tex_pos)
-{
-	/*taux d’étirement de la texture*/
-	*step = (float)t->h / (float)h;
-	/*position de départ dans la texture (première ligne à lire)*/
-	*tex_pos = (y0 - (HEIGHT - h) / 2) * (*step);
-}
-
-/* --------------------------- Texture utils ------------------------------- */
-
-int	pack_rgb_24(unsigned char r, unsigned char g, unsigned char b)
-{
-	return ((int)r << 16 | (int)g << 8 | (int)b);
-}
-
- int	tex_read(const t_tex *t, int tx, int ty)
-{
-	int					bpp8;
-	const unsigned char	*p;
-	unsigned char		r;
-	unsigned char		g;
-	unsigned char		b;
-
-	if (tx < 0)
-		tx = 0;
-	if (tx >= t->w)
-		tx = t->w - 1;
-	if (ty < 0)
-		ty = 0;
-	if (ty >= t->h)
-		ty = t->h - 1;
-	bpp8 = t->bpp / 8;
-	p = (const unsigned char *)t->data + ty * t->size_line + tx * bpp8;
-	b = p[0];
-	g = p[1];
-	r = p[2];
-	return (pack_rgb_24(r, g, b));
-}
-
- int	load_texture(t_game *g, t_tex *t, const char *path)
-{
-	t->img = mlx_xpm_file_to_image(g->mlx, (char *)path, &t->w, &t->h);
-	if (!t->img)
-		return (1);
-	t->data = mlx_get_data_addr(t->img, &t->bpp, &t->size_line, &t->endian);
-	if (!t->data)
-		return (1);
-	return (0);
-}
-
-/* --------------------------- Raycast utils --------------------------------*/
-
-int	is_close_to_grid(float v, float cell, float gap_epsilion)
-{
-	float	mod;
-
-	mod = fmodf(v, cell);
-	if (mod < gap_epsilion)
-		return (1);
-	if ((cell - mod) < gap_epsilion)
-		return (1);
-	return (0);
-}
-
-/* --------------------------- Raycast utils (DDA) -------------------------- */
-
-/* test direct sur la grille (en indices de cellules) */
-static inline int map_cell_is_wall(t_game *g, int mx, int my)
-{
-	if (mx < 0 || my < 0) return 1;
-	if (!g->map[my]) return 1;
-	if (!g->map[my][mx]) return 1;
-	return (g->map[my][mx] == '1');
-}
-
-/* Lancer de rayon version DDA :
-   - travaille en coordonnées "cases" pour le DDA,
-   - renvoie une distance perpendiculaire (anti-fisheye) en PIXELS,
-   - et les coordonnées d'impact h.ray_x / h.ray_y en PIXELS aussi. */
-t_hit	cast_ray(t_game *g, float ang)
-{
-	t_hit		h;
-	double		dirX, dirY;
-	double		posX, posY;
-	int			mapX, mapY;
-	double		deltaDistX, deltaDistY;
-	double		sideDistX, sideDistY;
-	int			stepX, stepY;
-	int			side; /* 0 => mur vertical (on a franchi en X), 1 => mur horizontal (en Y) */
-	double		perpWallDist;
-	double		hitX, hitY;
-
-	/* direction du rayon */
-	dirX = cos(ang);
-	dirY = sin(ang);
-
-	/* position caméra en UNITÉS DE CASES (pas en pixels) */
-	posX = g->player.x / (double)BLOCK;
-	posY = g->player.y / (double)BLOCK;
-
-	/* case de départ */
-	mapX = (int)posX;
-	mapY = (int)posY;
-
-	/* longueurs de rayons jusqu’à la prochaine séparation de cases */
-	deltaDistX = (dirX == 0.0) ? 1e30 : fabs(1.0 / dirX);
-	deltaDistY = (dirY == 0.0) ? 1e30 : fabs(1.0 / dirY);
-
-	/* initialisation des pas et sideDist */
-	if (dirX < 0) { stepX = -1; sideDistX = (posX - mapX) * deltaDistX; }
-	else          { stepX =  1; sideDistX = (mapX + 1.0 - posX) * deltaDistX; }
-	if (dirY < 0) { stepY = -1; sideDistY = (posY - mapY) * deltaDistY; }
-	else          { stepY =  1; sideDistY = (mapY + 1.0 - posY) * deltaDistY; }
-
-	/* DDA : avance de frontière en frontière jusqu’à toucher un mur */
-	for (;;)
-	{
-		if (sideDistX < sideDistY)
-		{
-			sideDistX += deltaDistX;
-			mapX += stepX;
-			side = 0; /* mur “vertical” */
-		}
-		else
-		{
-			sideDistY += deltaDistY;
-			mapY += stepY;
-			side = 1; /* mur “horizontal” */
-		}
-		if (map_cell_is_wall(g, mapX, mapY))
-			break;
-	}
-
-	/* distance perpendiculaire (pas besoin de correction de fish-eye) */
-	if (side == 0) perpWallDist = sideDistX - deltaDistX;
-	else           perpWallDist = sideDistY - deltaDistY;
-	if (perpWallDist < 1e-6) perpWallDist = 1e-6;
-
-	/* point d’impact en PIXELS (utile pour l’alignement texture existant) */
-	hitX = (posX + perpWallDist * dirX) * (double)BLOCK;
-	hitY = (posY + perpWallDist * dirY) * (double)BLOCK;
-
-	h.ray_x = (float)hitX;
-	h.ray_y = (float)hitY;
-	h.side  = side;
-
-	/* ta pipeline attend une dist en pixels (cf. compute_strip_bounds) */
-	h.dist  = (float)(perpWallDist * (double)BLOCK);
-
-	return h;
-}
-
-
-int compute_tex_x(const t_tex *t, const t_hit *h, float ray_ang)
-{
-    float offset;
-
-    if (h->side == 0) offset = fmodf(h->ray_y, BLOCK) / BLOCK; // mur vertical
-    else              offset = fmodf(h->ray_x, BLOCK) / BLOCK; // mur horizontal
-
-    int tx = (int)(offset * (float)t->w);
-
-    // flip optionnel pour cohérence
-    if ((h->side == 0 && cosf(ray_ang) > 0.0f) || (h->side == 1 && sinf(ray_ang) < 0.0f))
-        tx = t->w - 1 - tx;
-    return tx;
-}
-
-/* --------------------------- Map utils ----------------------------------- */
-
- bool	touch(float px, float py, t_game *g)
-{
-	int	cx;
-	int	cy;
-
-	cx = (int)(px / BLOCK);
-	cy = (int)(py / BLOCK);
-	if (cx < 0 || cy < 0)
-		return (true);
-	if (!g->map[cy])
-		return (true);
-	if (!g->map[cy][cx])
-		return (true);
-	return (g->map[cy][cx] == '1');
-}
-
- void	draw_square(int x, int y, int s, int color, t_game *g)
-{
-	int	i;
-
-	i = 0;
-	while (i < s)
-	{
-		put_pixel(x + i, y, color, g);
-		put_pixel(x, y + i, color, g);
-		put_pixel(x + s, y + i, color, g);
-		put_pixel(x + i, y + s, color, g);
-		i++;
-	}
-}
-
- void	draw_map(t_game *g)
-{
-	int		y;
-	int		x;
-	char	**m;
-
-	m = g->map;
-	y = 0;
-	while (m[y])
-	{
-		x = 0;
-		while (m[y][x])
-		{
-			if (m[y][x] == '1')
-				draw_square(x * BLOCK, y * BLOCK, BLOCK, 0x0000FF, g);
-			x++;
-		}
-		y++;
-	}
-}
-
-/* --------------------------- Maths --------------------------------------- */
-
- float	dist2(float x, float y)
-{
-	return (sqrtf(x * x + y * y));
-}
-
-/* --------------------------- Draw column --------------------------------- */
-
-void draw_line(t_player *p, t_game *g, float ray_ang, int col)
-{
-    (void)p;
-    t_hit h = cast_ray(g, ray_ang);
-
-    int y0, y1, hh;
-    compute_strip_bounds(h.dist, &y0, &y1, &hh);
-
-    /* -> indices de cellule (la position d’impact est déjà dans le mur) */
-    int cx = (int)(h.ray_x / BLOCK);
-    int cy = (int)(h.ray_y / BLOCK);
-
-    /* -> choisir la texture : “solo” si bloc isolé, sinon V/H selon le côté */
-    const t_tex *tex;
-    if (is_solo_block(g, cy, cx))
-        tex = &g->wall_solo;
-    else
-        tex = (h.side == 0) ? &g->wall_v : &g->wall_h;
-
-    int   tx = compute_tex_x(tex, &h, ray_ang);
-    float step, tex_pos;
-    compute_tex_vscroll(tex, hh, y0, &step, &tex_pos);
-
-    while (y0 < y1)
+    i = 0;
+    while (cand[i])
     {
-        int ty = (int)tex_pos;  tex_pos += step;
-        int color = tex_read(tex, tx, ty);
+        n = strlen(cand[i]);
+        if (n && cand[i][n - 1] == '/')
+            snprintf(buf, sizeof(buf), "%s%s", cand[i], file);
+        else
+            snprintf(buf, sizeof(buf), "%s", cand[i]);
+        if (load_xpm(g, dst, buf))
+            return (1);
+        i++;
+    }
+    return (0);
+}
 
-        put_pixel(col, y0, color, g);
-        y0++;
+/* Crée une image MLX (framebuffer de rendu) de taille (w,h).
+   - stocke son pointeur et les métadonnées (bpp, line_len, endian) */
+int     create_frame(t_game *g, int w, int h)
+{
+    g->frame.w = w;
+    g->frame.h = h;
+    g->frame.img = mlx_new_image(g->mlx, w, h);
+    if (!g->frame.img)
+        return (0);
+    g->frame.addr = mlx_get_data_addr(g->frame.img, &g->frame.bpp,
+                                      &g->frame.line_len, &g->frame.endian);
+    if (!g->frame.addr)
+        return (0);
+    return (1);
+}
+
+/* Détruit l'image MLX utilisée comme framebuffer (si elle existe) */
+void    destroy_frame(t_game *g)
+{
+    if (g->frame.img)
+        mlx_destroy_image(g->mlx, g->frame.img);
+    g->frame.img = NULL;
+}
+
+/* Charge un fichier XPM sur disque dans une structure t_tex.
+   - mlx_xpm_file_to_image remplit t->w et t->h (dimensions)
+   - mlx_get_data_addr permet d'accéder aux pixels (addr/bpp/stride/endian) */
+int     load_xpm(t_game *g, t_tex *dst, const char *path)
+{
+    dst->img = mlx_xpm_file_to_image(g->mlx, (char *)path, &dst->w, &dst->h);
+    if (!dst->img)
+        return (0);
+    dst->addr = mlx_get_data_addr(dst->img, &dst->bpp, &dst->line_len, &dst->endian);
+    return (!!dst->addr);
+}
+
+/* Détruit l'image MLX d'une texture (si elle existe) */
+void    destroy_tex(t_game *g, t_tex *t)
+{
+    if (t->img)
+        mlx_destroy_image(g->mlx, t->img);
+    t->img = NULL;
+}
+
+/* ==========================================================================
+**  Carte — petite map codée en dur
+**  --------------------------------------------------------------------------
+**  g_small_map : tableau de chaînes représentant la carte (1 = mur, 0 = vide)
+**  setup_map_small : copie g_small_map en mémoire dynamique dans g->map
+**                    + calcule la largeur (map_w) et hauteur (map_h)
+** ========================================================================== */
+
+static const char *g_small_map[] = {
+    "1111111111111111111111111111111111",
+    "1000000000000000000000000000000001",
+    "1000000000000000000000000000000001",
+    "1000000000000000000000000000000001",
+    "1000000000000000000000000000000001",
+    "1000000000000000000000000000000001",
+    "1000000000000000000000000000000001",
+    "1000000000000000000000000000000001",
+    "1000111100000000000000000000000001",
+    "1000100000000000000000000000000001",
+    "1000100111000000000000000000000001",
+    "1000000000000000000000000000000001",
+    "1111111111111111111111111111111111",
+    NULL
+};
+
+void    setup_map_small(t_game *g)
+{
+    int h, i, w, j;
+
+    /* Mesure la hauteur (nombre de lignes) de la carte statique */
+    h = 0;
+    while (g_small_map[h]) h++;
+    g->map_h = h;
+
+    /* Calcule la largeur maximale parmi les lignes (sécurité) */
+    g->map_w = 0;
+    i = 0;
+    while (i < h)
+    {
+        w = 0;
+        while (g_small_map[i][w]) w++;
+        if (w > g->map_w) g->map_w = w;
+        i++;
+    }
+
+    /* Alloue g->map (copie dynamique) + 1 pour un pointeur NULL final */
+    g->map = (char **)malloc(sizeof(char *) * (h + 1));
+    if (!g->map) panic("malloc map");
+
+    /* Copie chaque ligne dans un buffer alloué (terminé par '\0') */
+    i = 0;
+    while (i < h)
+    {
+        w = 0;
+        while (g_small_map[i][w]) w++;
+        g->map[i] = (char *)malloc(w + 1);
+        if (!g->map[i]) panic("malloc row");
+        j = 0;
+        while (j < w) { g->map[i][j] = g_small_map[i][j]; j++; }
+        g->map[i][w] = '\0';
+        i++;
+    }
+    /* Termine le tableau de lignes par NULL (facilite les parcours) */
+    g->map[h] = NULL;
+}
+
+/* ==========================================================================
+**  Player Setup
+**  --------------------------------------------------------------------------
+**  deg_to_rad  : conversion degrés -> radians
+**  setup_player: initialise position, direction et plan caméra (FOV)
+** ========================================================================== */
+
+static float   deg_to_rad(float d) { return d * (float)M_PI / 180.0f; }
+
+void    setup_player(t_game *g, float px, float py, float dir_deg)
+{
+    float a = deg_to_rad(dir_deg);              /* angle initial en radians */
+    float plane_len = tanf(deg_to_rad(FOV * 0.5f)); /* longueur du plan (FOV/2) */
+
+    /* Centre le joueur au milieu de la case (px,py) */
+    g->p.pos.x = px + 0.5f;
+    g->p.pos.y = py + 0.5f;
+
+    /* Vecteur direction (face où regarde le joueur) */
+    g->p.dir.x = cosf(a);
+    g->p.dir.y = sinf(a);
+
+    /* Vecteur plan caméra (perpendiculaire à dir, définit l'ouverture du FOV) */
+    g->p.plane.x = -g->p.dir.y * plane_len;
+    g->p.plane.y =  g->p.dir.x * plane_len;
+}
+
+/* ==========================================================================
+**  DDA — rendu d'une colonne
+**  --------------------------------------------------------------------------
+**  is_wall     : renvoie true si (mx,my) est un mur (ou hors carte = solide)
+**  cast_column : RAYCASTING PAR DDA (Digital Differential Analyzer)
+**                - Calcule la direction du rayon pour la colonne écran x
+**                - Avance de case en case (grille) jusqu'à heurter un mur
+**                - Calcule la distance perpendiculaire (anti fish-eye)
+**                - Dessine CIEL (texturé), SOL (floor-casting), MUR (texturé)
+** ========================================================================== */
+
+static bool is_wall(t_game *g, int mx, int my)
+{
+    /* Toute coordonnée hors carte est considérée "mur" (solide) */
+    if (mx < 0 || my < 0 || my >= g->map_h || mx >= g->map_w)
+        return true;
+    /* Mur si caractère == '1' */
+    return (g->map[my][mx] == '1');
+}
+
+void    cast_column(t_game *g, int x)
+{
+    /* x_cam ∈ [-1,1] : position horizontale normalisée de la colonne x */
+    float   x_cam = 2.0f * x / (float)WIN_W - 1.0f;
+
+    /* Direction du rayon pour cette colonne :
+       dir_cam = dir_joueur + plane * x_cam (modifie selon l’angle écran) */
+    float   ray_dir_x = g->p.dir.x + g->p.plane.x * x_cam;
+    float   ray_dir_y = g->p.dir.y + g->p.plane.y * x_cam;
+
+    /* Case de départ dans la grille (projection entière de la position joueur) */
+    int     map_x = (int)g->p.pos.x;
+    int     map_y = (int)g->p.pos.y;
+
+    /* delta_x/delta_y = distance pour traverser une case entière en X/Y
+       (pré-calcul nécessaire pour comparer les distances dans la DDA) */
+    float   delta_x = (ray_dir_x == 0) ? 1e30f : fabsf(1.0f / ray_dir_x);
+    float   delta_y = (ray_dir_y == 0) ? 1e30f : fabsf(1.0f / ray_dir_y);
+
+    /* step_x/step_y : sens d’incrémentation (±1) selon le signe du rayon
+       side_x/side_y : distance actuelle jusqu’à la première frontière X/Y */
+    int     step_x, step_y;
+    float   side_x, side_y;
+
+    if (ray_dir_x < 0) { step_x = -1; side_x = (g->p.pos.x - map_x) * delta_x; }
+    else               { step_x =  1; side_x = (map_x + 1.0f - g->p.pos.x) * delta_x; }
+    if (ray_dir_y < 0) { step_y = -1; side_y = (g->p.pos.y - map_y) * delta_y; }
+    else               { step_y =  1; side_y = (map_y + 1.0f - g->p.pos.y) * delta_y; }
+
+    /* Boucle DDA : on avance toujours du côté le plus proche (X ou Y)
+       jusqu’à heurter une case "mur". hit_side = 0 si impact vertical, 1 si horizontal */
+    int     hit_side = 0;
+    while (!is_wall(g, map_x, map_y))
+    {
+        if (side_x < side_y) { side_x += delta_x; map_x += step_x; hit_side = 0; }
+        else                 { side_y += delta_y; map_y += step_y; hit_side = 1; }
+    }
+
+    /* Distance perpendiculaire au mur (corrige le fish-eye) + point d’impact le long du mur */
+    float   perp_dist, wall_x;
+    if (hit_side == 0)
+    {
+        /* Impact sur une paroi verticale : on calcule la distance le long de X */
+        perp_dist = (map_x - g->p.pos.x + (1 - step_x) * 0.5f) / ray_dir_x;
+        /* Position d’impact sur l’axe Y (pour texturer correctement) */
+        wall_x = g->p.pos.y + perp_dist * ray_dir_y;
+    }
+    else
+    {
+        /* Impact sur une paroi horizontale : distance le long de Y */
+        perp_dist = (map_y - g->p.pos.y + (1 - step_y) * 0.5f) / ray_dir_y;
+        /* Position d’impact sur l’axe X (pour texturer) */
+        wall_x = g->p.pos.x + perp_dist * ray_dir_x;
+    }
+    /* Garde la partie fractionnaire (0..1) pour connaître l’offset sur le mur */
+    wall_x -= floorf(wall_x);
+    /* Évite une division par 0 dans le calcul de hauteur de bande */
+    if (perp_dist < 1e-6f) perp_dist = 1e-6f;
+
+    /* Taille de la bande verticale (plus le mur est proche, plus c’est haut) */
+    int line_h = (int)(WIN_H / perp_dist);
+    /* Y de début/fin de la bande mur (centrage vertical) */
+    int draw_start = -line_h / 2 + WIN_H / 2;
+    int draw_end   =  line_h / 2 + WIN_H / 2;
+    /* Borne le dessin à l’écran */
+    if (draw_start < 0) draw_start = 0;
+    if (draw_end >= WIN_H) draw_end = WIN_H - 1;
+
+    /* ---------- CIEL TEXTURÉ (panorama horizontal + léger défilement) ---------- */
+    if (g->tex_sky.img)
+    {
+        /* Convertit la direction du rayon en angle (-pi..pi) puis en [0..1) */
+        float ang = atan2f(ray_dir_y, ray_dir_x);
+        float u01 = (ang / (2.0f * (float)M_PI)) + 0.5f;
+        /* Colonne dans la texture du ciel, avec un décalage qui varie lentement (g->tick/2) */
+        int   tx  = wrapi((int)(u01 * (float)g->tex_sky.w)
+                          + (g->tick / 2) % g->tex_sky.w, g->tex_sky.w); /* défilement lent */
+
+        /* Paramètre d’horizon : plus grand => horizon plus bas (plus de ciel visible en haut) */
+        const float horizon_y = WIN_H * 0.70f; /* ajuste 0.60..0.75 pour placer l’horizon */
+
+        int y = 0;
+        while (y < draw_start)  /* Dessine le ciel de la ligne 0 à draw_start-1 */
+        {
+            /* v01 mappe la hauteur écran vers la hauteur texture du ciel */
+            float v01 = (float)y / horizon_y;
+            int   ty  = (int)(v01 * (float)g->tex_sky.h);
+            ty = clampi(ty, 0, g->tex_sky.h - 1);
+            /* Lit la couleur du ciel à (tx, ty) et dessine le pixel */
+            int col = texel_at(&g->tex_sky, tx, ty);
+            put_pixel(&g->frame, x, y, col);
+            y++;
+        }
+    }
+    else
+    {
+        /* Fallback : si pas de texture ciel, on remplit le haut avec un bleu */
+        int y = 0;
+        while (y < draw_start) { put_pixel(&g->frame, x, y, rgb(120,180,255)); y++; }
+    }
+
+    /* ---------- SOL TEXTURÉ (floor casting corrigé) ----------
+       Technique : pour chaque ligne sous l’horizon, on calcule la distance
+       au "plan du sol" et on en déduit la coordonnée monde (floorX, floorY)
+       qu'on convertit en coordonnées texture (wrap).
+       Ici, on prend la *partie fractionnaire* de (floorX,floorY) pour éviter
+       les étirements (aliasing) à grande distance. */
+    if (g->tex_floor.img)
+    {
+        /* Directions des rayons aux extrémités gauche/droite de l’écran
+           (constantes pour une même ligne d’écran) */
+        float dir0x = g->p.dir.x - g->p.plane.x;
+        float dir0y = g->p.dir.y - g->p.plane.y;
+        float dir1x = g->p.dir.x + g->p.plane.x;
+        float dir1y = g->p.dir.y + g->p.plane.y;
+
+        /* Position “caméra” en Z = moitié de la hauteur d’écran (convention) */
+        float posZ = 0.5f * (float)WIN_H;
+
+        int y = draw_end + 1;    /* On démarre sous le mur affiché */
+        while (y < WIN_H)
+        {
+            /* p = distance verticale (pixels) entre la ligne y et l’horizon (centre) */
+            float p = (float)y - (float)WIN_H / 2.0f;
+            if (p == 0.0f) p = 0.0001f;       /* évite une division par 0 */
+            /* rowDist = distance au plan du sol correspondant à la ligne y */
+            float rowDist = posZ / p;
+
+            /* Position monde au bord gauche, puis interpolation linéaire vers x
+               (équivalent : floorX = pos + rowDist * dir0 + step * x) */
+            float floorX_left  = g->p.pos.x + rowDist * dir0x;
+            float floorY_left  = g->p.pos.y + rowDist * dir0y;
+            float floorX = floorX_left + (rowDist * (dir1x - dir0x)) * ((float)x / (float)WIN_W);
+            float floorY = floorY_left + (rowDist * (dir1y - dir0y)) * ((float)x / (float)WIN_W);
+
+            /* IMPORTANT : on ne garde que la fraction (0..1) pour échantillonner
+               la tuile de sol de manière répétée et stable (évite “l’étirement”). */
+            float fx = floorX - floorf(floorX);
+            float fy = floorY - floorf(floorY);
+            int   tx = (int)(fx * (float)g->tex_floor.w);
+            int   ty = (int)(fy * (float)g->tex_floor.h);
+
+            /* Lit la couleur dans la texture de sol */
+            int color = texel_at(&g->tex_floor, tx, ty);
+
+            /* Assombrissement doux avec la distance pour donner de la profondeur
+               (fonction 1 / (1 + k * d^2) ) */
+            float shade = 1.0f / (1.0f + 0.02f * rowDist * rowDist);
+            int rr = (int)(((color >> 16) & 255) * shade);
+            int gg = (int)(((color >> 8)  & 255) * shade);
+            int bb = (int)(( color        & 255) * shade);
+            color = rgb(rr, gg, bb);
+
+            /* Dessine le pixel de sol */
+            put_pixel(&g->frame, x, y, color);
+            y++;
+        }
+    }
+    else
+    {
+        /* Fallback : si pas de texture sol, on remplit la zone basse en vert */
+        int y = draw_end + 1;
+        while (y < WIN_H) { put_pixel(&g->frame, x, y, rgb(60,120,60)); y++; }
+    }
+
+    /* ---------- MUR TEXTURÉ ----------
+       On récupère l'abscisse de texture (tex_x) via wall_x (fraction 0..1)
+       + on parcourt verticalement la bande pour peindre chaque pixel du mur. */
+    {
+        /* Coordonnée horizontale dans la texture de mur (colonne) */
+        int   tex_x = (int)(wall_x * (float)g->tex_wall.w);
+        /* Inversion de texture selon la face impactée pour garder une cohérence
+           gauche/droite (évite d’avoir la texture “miroir” selon l’angle) */
+        if ((hit_side == 0 && ray_dir_x > 0) || (hit_side == 1 && ray_dir_y < 0))
+            tex_x = g->tex_wall.w - tex_x - 1;
+
+        /* step = combien de pixels texture on avance par pixel écran vertical */
+        float step = (float)g->tex_wall.h / (float)line_h;
+        /* Position de départ dans la texture (alignement vertical de la bande) */
+        float tex_pos = (draw_start - WIN_H / 2 + line_h / 2) * step;
+
+        int y = draw_start;
+        while (y <= draw_end)
+        {
+            /* Coordonnée verticale dans la texture (borne pour la sécurité) */
+            int tex_y = (int)tex_pos;
+            tex_y = clampi(tex_y, 0, g->tex_wall.h - 1);
+            tex_pos += step;
+
+            /* Adresse du texel (mur) à (tex_x, tex_y) */
+            char *tp = g->tex_wall.addr + (tex_y * g->tex_wall.line_len
+                         + tex_x * (g->tex_wall.bpp / 8));
+            int color = *(int *)tp;
+
+            /* Dessine le pixel de mur sur la colonne x, ligne y */
+            put_pixel(&g->frame, x, y, color);
+            y++;
+        }
     }
 }
 
+/* ==========================================================================
+**  Rendu complet
+**  --------------------------------------------------------------------------
+**  render_frame : itère les colonnes x=0..WIN_W-1, appelle cast_column,
+**                 puis affiche l'image MLX en fenêtre
+** ========================================================================== */
 
-
-
-/* --------------------------- Loop ---------------------------------------- */
-
- int	draw_loop(t_game *g)
+void    render_frame(t_game *g)
 {
-	t_player	*p;
-	float		step_ang;
-	float		ang;
-	int			col;
-
-	p = &g->player;
-	move_player(p);
-	draw_background(g);
-	if (DEBUG)
-	{
-		draw_square((int)p->x, (int)p->y, 10, 0x00FF00, g);
-		draw_map(g);
-	}
-	step_ang = PI / 3.0f / (float)WIDTH;
-	ang = p->angle - (PI / 6.0f);
-	col = 0;
-	while (col < WIDTH)
-	{
-		draw_line(p, g, ang, col);
-		ang += step_ang;
-		col++;
-	}
-	mlx_put_image_to_window(g->mlx, g->win, g->img, 0, 0);
-	return (0);
-}
-void	draw_floor_scaled_tile(t_game *g, float scale)
-{
-	int x, y, tx, ty, color, tw, th, half;
-
-	if (!g->floor_tex.data || scale <= 0.f)
-		return ;
-	tw = g->floor_tex.w;
-	th = g->floor_tex.h;
-	half = HEIGHT / 2;
-
-	y = half;
-	while (y < HEIGHT)
-	{
-		ty = ((int)((y - half) / scale)) % th;
-		if (ty < 0) ty += th;
-		x = 0;
-		while (x < WIDTH)
-		{
-			tx = ((int)(x / scale)) % tw;
-			if (tx < 0) tx += tw;
-			color = tex_read(&g->floor_tex, tx, ty);
-			put_pixel(x, y, color, g);
-			x++;
-		}
-		y++;
-	}
-}
-void	draw_floor(t_game *g)
-{
-	int	x;
-	int	y;
-	int	tx;
-	int	ty;
-	int	color;
-	int	half;
-	int	tw;
-	int	th;
-
-	if (!g->floor_tex.data)
-		return ;
-	tw = g->floor_tex.w;
-	th = g->floor_tex.h;
-	half = HEIGHT / 2;
-
-	/* moitié basse de l'écran = sol (image tuilée, écran-fixé) */
-	y = half;
-	while (y < HEIGHT)
-	{
-		/* répète verticalement */
-		ty = (y - half) % th;
-		if (ty < 0)
-			ty += th;
-		x = 0;
-		while (x < WIDTH)
-		{
-			/* répète horizontalement */
-			tx = x % tw;
-			if (tx < 0)
-				tx += tw;
-
-			color = tex_read(&g->floor_tex, tx, ty);
-			put_pixel(x, y, color, g);
-			x++;
-		}
-		y++;
-	}
+    int x = 0;
+    while (x < WIN_W) { cast_column(g, x); x++; }
+    /* Affiche le framebuffer (image MLX) dans la fenêtre à la position (0,0) */
+    mlx_put_image_to_window(g->mlx, g->win, g->frame.img, 0, 0);
 }
 
+/* ==========================================================================
+**  Hooks clavier + boucle principale
+**  --------------------------------------------------------------------------
+**  key_press   : met à true les flags de touches pressées (WASD, flèches)
+**  key_release : met à false les flags de touches relâchées
+**  move_and_rotate : applique les déplacements (avec collision) et la rotation
+**  loop_hook   : tick d'animation + mouvement + rendu (appelé chaque frame)
+** ========================================================================== */
 
-int	draw_background(t_game *g)
+int     key_press(int keycode, t_game *g)
 {
-	int   x, y;
-	int   half = HEIGHT / 2;
-
-	/* SKY (garde comme tu l'as) */
-	y = 0;
-	while (y < half)
-	{
-		int ty = (int)((float)y * (float)g->sky.h / (float)half);
-		x = 0;
-		while (x < WIDTH)
-		{
-			int tx = (int)((float)x * (float)g->sky.w / (float)WIDTH);
-			int color = tex_read(&g->sky, tx, ty);
-			put_pixel(x, y, color, g);
-			x++;
-		}
-		y++;
-	}
-
-	/* FLOOR (remplace l'appel actuel par celui-ci) */
-	draw_floor(g);
-	return (0);
-}
-/* --------------------------- Main ---------------------------------------- */
-
-int	main(void)
-{
-	t_game	g;
-
-	if (init_game(&g) != 0)
-		return (1);
-	if (load_texture(&g, &g.wall_v, "src/wall.xpm") != 0) 
-		return (1);
-	if (load_texture(&g, &g.wall_h, "src/wall.xpm") != 0)
-		return (1);
-    if (load_texture(&g, &g.sky, "src/sky.xpm") != 0)
-        return (1);
-    if (load_texture(&g, &g.floor_tex, "src/floor.xpm") != 0)
-        return (1);
-	if (load_texture(&g, &g.wall_solo,"src/wall.xpm"))
-		return (1);
-	mlx_hook(g.win, 2, 1L << 0, key_press, &g.player);
-	mlx_hook(g.win, 3, 1L << 1, key_release, &g.player);
-	mlx_loop_hook(g.mlx, draw_loop, &g);
-	mlx_loop(g.mlx);
-	return (0);
+    if (keycode == KEY_ESC) close_window(g); /* Fermeture immédiate */
+    else if (keycode == KEY_W) g->keys.w = true;
+    else if (keycode == KEY_A) g->keys.a = true;
+    else if (keycode == KEY_S) g->keys.s = true;
+    else if (keycode == KEY_D) g->keys.d = true;
+    else if (keycode == KEY_LEFT)  g->keys.left = true;
+    else if (keycode == KEY_RIGHT) g->keys.right = true;
+    return (0);
 }
 
+int     key_release(int keycode, t_game *g)
+{
+    if (keycode == KEY_W) g->keys.w = false;
+    else if (keycode == KEY_A) g->keys.a = false;
+    else if (keycode == KEY_S) g->keys.s = false;
+    else if (keycode == KEY_D) g->keys.d = false;
+    else if (keycode == KEY_LEFT)  g->keys.left = false;
+    else if (keycode == KEY_RIGHT) g->keys.right = false;
+    return (0);
+}
+
+static void move_and_rotate(t_game *g)
+{
+    /* Vecteur avant (direction du joueur) et droite (dir tournée de 90°) */
+    t_v2f forward = g->p.dir;
+    t_v2f right = (t_v2f){ g->p.dir.y, -g->p.dir.x };
+    float nx, ny;
+
+    /* Avancer (W) : on essaie d'avancer sur X puis Y en vérifiant les murs (collision AABB simple) */
+    if (g->keys.w)
+    {
+        nx = g->p.pos.x + forward.x * MOVE_SPEED;
+        ny = g->p.pos.y + forward.y * MOVE_SPEED;
+        if (!is_wall(g, (int)nx, (int)g->p.pos.y)) g->p.pos.x = nx;
+        if (!is_wall(g, (int)g->p.pos.x, (int)ny)) g->p.pos.y = ny;
+    }
+    /* Reculer (S) : pareil mais en sens inverse */
+    if (g->keys.s)
+    {
+        nx = g->p.pos.x - forward.x * MOVE_SPEED;
+        ny = g->p.pos.y - forward.y * MOVE_SPEED;
+        if (!is_wall(g, (int)nx, (int)g->p.pos.y)) g->p.pos.x = nx;
+        if (!is_wall(g, (int)g->p.pos.x, (int)ny)) g->p.pos.y = ny;
+    }
+    /* Strafe gauche (A) : déplacement latéral à gauche (vector right négatif) */
+    if (g->keys.a)
+    {
+        nx = g->p.pos.x - right.x * MOVE_SPEED;
+        ny = g->p.pos.y - right.y * MOVE_SPEED;
+        if (!is_wall(g, (int)nx, (int)g->p.pos.y)) g->p.pos.x = nx;
+        if (!is_wall(g, (int)g->p.pos.x, (int)ny)) g->p.pos.y = ny;
+    }
+    /* Strafe droit (D) : déplacement latéral à droite (vector right positif) */
+    if (g->keys.d)
+    {
+        nx = g->p.pos.x + right.x * MOVE_SPEED;
+        ny = g->p.pos.y + right.y * MOVE_SPEED;
+        if (!is_wall(g, (int)nx, (int)g->p.pos.y)) g->p.pos.x = nx;
+        if (!is_wall(g, (int)g->p.pos.x, (int)ny)) g->p.pos.y = ny;
+    }
+
+    /* Rotation gauche/droite via matrices de rotation 2D sur dir et plane */
+    if (g->keys.left || g->keys.right)
+    {
+        float ang = (g->keys.left ? -ROT_SPEED : ROT_SPEED);
+        /* Rotation du vecteur direction */
+        float odx = g->p.dir.x;
+        g->p.dir.x = g->p.dir.x * cosf(ang) - g->p.dir.y * sinf(ang);
+        g->p.dir.y = odx          * sinf(ang) + g->p.dir.y * cosf(ang);
+
+        /* Rotation du plan caméra (même angle) */
+        float opx = g->p.plane.x;
+        g->p.plane.x = g->p.plane.x * cosf(ang) - g->p.plane.y * sinf(ang);
+        g->p.plane.y = opx           * sinf(ang) + g->p.plane.y * cosf(ang);
+    }
+}
+
+int     loop_hook(t_game *g)
+{
+    g->tick++;              /* Incrémente un compteur (sert au défilement du ciel) */
+    move_and_rotate(g);     /* Applique les entrées clavier et met à jour la caméra */
+    render_frame(g);        /* Recalcule toute la frame et l'affiche */
+    return (0);
+}
+
+/* ==========================================================================
+**  Quitter proprement
+**  --------------------------------------------------------------------------
+**  close_window : libère textures, frame, fenêtre et display MLX puis exit
+** ========================================================================== */
+
+int     close_window(t_game *g)
+{
+    destroy_tex(g, &g->tex_wall);
+    destroy_tex(g, &g->tex_floor);
+    destroy_tex(g, &g->tex_sky);
+    destroy_frame(g);
+    if (g->win) mlx_destroy_window(g->mlx, g->win);
+    if (g->mlx) mlx_destroy_display(g->mlx), free(g->mlx);
+    exit(0);
+    return (0);
+}
+
+/* ==========================================================================
+**  main — flux global
+**  --------------------------------------------------------------------------
+**  - init structures (memset)
+**  - init MLX (contexte + fenêtre)
+**  - créer framebuffer
+**  - charger textures (mur/sky/sol) depuis différents chemins possibles
+**  - construire une petite carte et placer le joueur
+**  - installer les hooks (clavier, fermeture, boucle)
+**  - lancer la boucle MLX
+** ========================================================================== */
+
+int     main(void)
+{
+    t_game  g;
+
+    /* Met la structure à zéro (évite des pointeurs “sauvages”) */
+    __builtin_memset(&g, 0, sizeof(g));
+
+    /* Initialisation MLX : ouvre une connexion au serveur X */
+    g.mlx = mlx_init();
+    if (!g.mlx) panic("mlx_init failed");
+
+    /* Crée une fenêtre de taille WIN_W × WIN_H avec un titre */
+    g.win = mlx_new_window(g.mlx, WIN_W, WIN_H, "poke3DDA engine");
+    if (!g.win) panic("mlx_new_window failed");
+
+    /* Crée l'image (framebuffer) dans laquelle on dessinera chaque frame */
+    if (!create_frame(&g, WIN_W, WIN_H)) panic("create_frame failed");
+
+    /* Mur: mets "wall.xpm" si tu veux un mur classique — ici on utilise "tree1.xpm"
+       pour bloquer comme un “arbre” impassable (façon barrière naturelle). */
+    if (!try_load_xpm_paths(&g, &g.tex_wall, "tree1.xpm"))
+        panic("load wall texture failed");
+
+    /* Ciel panoramique (défilement doux dans cast_column) */
+    if (!try_load_xpm_paths(&g, &g.tex_sky, "sky.xpm"))
+        panic("load sky.xpm failed");
+
+    /* Sol texturé (floor casting) : idéalement une tuile “herbe” seamless */
+    if (!try_load_xpm_paths(&g, &g.tex_floor, "floor.xpm"))
+        panic("load floor.xpm failed");
+
+    /* Construit la mini-carte et place le joueur en (2,2), regardant vers +X (0°) */
+    setup_map_small(&g);
+    setup_player(&g, 2, 2, 0.0f);
+
+    /* Installe les hooks :
+       - DestroyNotify: fermeture de la fenêtre
+       - KeyPress/KeyRelease: gestion des entrées clavier
+       - loop_hook: callback appelé en boucle chaque “frame” */
+    mlx_hook(g.win, DestroyNotify, StructureNotifyMask, close_window, &g);
+    mlx_hook(g.win, KeyPress, KeyPressMask, key_press, &g);
+    mlx_hook(g.win, KeyRelease, KeyReleaseMask, key_release, &g);
+    mlx_loop_hook(g.mlx, loop_hook, &g);
+
+    /* Démarre le tick et dessine une frame initiale (optionnel, pour éviter un flash noir) */
+    g.tick = 0;
+    render_frame(&g);
+
+    /* Boucle événementielle MLX (ne retourne pas avant la fermeture) */
+    mlx_loop(g.mlx);
+    return (0);
+}
